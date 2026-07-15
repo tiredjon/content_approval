@@ -46,8 +46,9 @@ file, so this works with no other services running.
 ## Test
 
 ```bash
-make test      # uv run pytest
-make lint      # uv run ruff check .
+make test        # uv run pytest
+make lint        # uv run ruff check .
+make typecheck    # uv run mypy
 ```
 
 102 tests, all against an in-memory SQLite DB (fast, isolated per test — see `tests/conftest.py`) except

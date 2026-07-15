@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -39,7 +41,9 @@ def _problem(status_code: int, detail: str, **extra: object) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=body, media_type=_PROBLEM_MEDIA_TYPE)
 
 
-def _clean_validation_errors(errors: list[dict]) -> list[dict]:
+def _clean_validation_errors(
+    errors: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
     """`ctx` (Pydantic's internal message-templating context) sometimes carries the
     raw exception object for custom `field_validator`s, which isn't JSON-serializable
     and isn't meant for API consumers anyway — `msg` already has the resolved text.

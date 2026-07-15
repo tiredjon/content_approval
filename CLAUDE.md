@@ -138,11 +138,42 @@ work, and update it (plus the architecture/decisions sections) after every meani
       with hand-verified GitHub anchor links, a test-coverage summary in the Test section, one factual
       fix (Docker section said `python:3.12-slim`, corrected to match the Dockerfile's actual
       `python:3.12-slim-bookworm`).
-- [ ] **Phase 10 — Polish pass**: lint/type-check clean, re-read assignment against implementation for
-      gaps.
+- [x] **Phase 10 — Polish pass (final phase)**. Re-read the assignment line by line against the actual
+      implementation: every HTTP path verified against the app's real `app.routes` (not just eyeballed
+      against the code) — `/health`, `/ready`, and all 6 `.../approval-requests[...]` routes match the
+      spec exactly; every constraint (isolation, idempotency, one-way final state, audit trail,
+      event-readiness, no-secrets) re-confirmed already covered by Phases 1-8 and Phase 7's gap audit;
+      auth action names (`approval:read/create/decide/cancel`) match the spec's table exactly; every
+      "what to attach" item present (`README.md`, `DESIGN.md`, migrations, tests, source) except pushing
+      to Git and submitting the form, which is the user's own step. Added type-checking, which wasn't
+      adopted in any earlier phase despite being in this phase's original description: ran `mypy` cold
+      (via `uvx`, no project changes yet) to gauge scope before committing to it — found exactly 4 errors
+      across 35 files, all real (not stub noise to suppress): (1) `_as_utc` was typed
+      `datetime | None -> datetime | None` and used for the *always-non-null* `created_at`/`updated_at`,
+      losing the fact that those columns are `NOT NULL`; split into `_as_utc` (non-optional, for the
+      required columns) and `_as_utc_or_none` (for the genuinely-nullable `decided_at`) — a real type
+      *and* documentation improvement, not just a fix for mypy's sake; (2) `_clean_validation_errors`'s
+      parameter was typed `list[dict]` when Pydantic's `exc.errors()` returns a `Sequence` of
+      `Mapping`-like objects — loosened to `Sequence[Mapping[str, Any]]`; (3) `CursorResult.rowcount`
+      accessed through the more generic `Result[Any]` return type of `session.execute()` — a known
+      SQLAlchemy stub gap, addressed with a narrow, commented `# type: ignore[attr-defined]` rather than
+      restructuring working code around an imperfect stub. Formally adopted: `mypy` added to dev deps,
+      `[tool.mypy]` in `pyproject.toml`, `make typecheck`. Also scanned for leftover TODO/FIXME/debug
+      `print()` calls (none found) and for anything resembling a real credential/API key pattern across
+      the whole repo (none found). Final state: **102 tests, ruff clean, mypy clean.**
+      Git housekeeping was already being handled directly by the user in parallel throughout this
+      project (5 commits exist — `initial` through `phase 9` — and `origin/main` is fully in sync with
+      local `main`); nothing needed there.
 
 Work one phase at a time; do not jump ahead. Stop and hand control back after finishing a phase rather
 than silently continuing into the next one.
+
+**All 10 planned phases are complete** as of the above. If picking this project back up: there's no
+queued next phase — check with the user for new scope (e.g. a real event publisher, an audit-log read
+endpoint, auth beyond the stub) rather than assuming one of the "known compromises" in `DESIGN.md` is
+implicitly next up. Re-run `make test`, `make lint`, `make typecheck`, and (if touching anything
+DB-related) `uv run alembic check` before considering any new change done — that's the bar every phase
+above was held to.
 
 **Resolved during Phase 7**: the `httpx2`/`StarletteDeprecationWarning` noted since Phase 0 is a real,
 published package, but adopting it is a dependency upgrade with an unreviewed API surface, not a test
@@ -157,6 +188,7 @@ make run       # uv run uvicorn app.main:app --reload
 make test      # uv run pytest
 make lint      # uv run ruff check .
 make format    # uv run ruff format .
+make typecheck # uv run mypy
 ```
 
 Single test: `uv run pytest tests/test_health.py::test_health_returns_ok`

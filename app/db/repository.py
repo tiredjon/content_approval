@@ -96,7 +96,10 @@ class SqlApprovalRequestRepository(ApprovalRequestRepository):
         )
         result = await self._session.execute(stmt)
 
-        if result.rowcount == 1:
+        # SQLAlchemy's `execute()` return type is typed generically as `Result[Any]`,
+        # but an UPDATE/DELETE always yields a `CursorResult` at runtime, which does
+        # have `.rowcount` — a known gap in the stubs, not an actual type error.
+        if result.rowcount == 1:  # type: ignore[attr-defined]
             updated = await self.get(workspace_id=workspace_id, request_id=request_id)
             if updated is None:  # pragma: no cover - would mean rows vanish mid-transaction
                 raise RuntimeError(f"request {request_id} vanished right after transition")
@@ -176,14 +179,16 @@ class SqlApprovalRequestRepository(ApprovalRequestRepository):
         )
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
+def _as_utc(value: datetime) -> datetime:
     """SQLite drops tzinfo on round-trip (Postgres doesn't), so a freshly-created row
     and the same row re-fetched from the DB would otherwise serialize differently.
     Every datetime we write is already UTC wall-clock time, so a naive value just needs
     the label attached; an aware one (Postgres) is normalized to UTC for consistency."""
-    if value is None:
-        return None
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _as_utc_or_none(value: datetime | None) -> datetime | None:
+    return None if value is None else _as_utc(value)
 
 
 def _to_entity(row: ApprovalRequestRow, reviewer_user_ids: Sequence[str]) -> ApprovalRequest:
@@ -200,7 +205,7 @@ def _to_entity(row: ApprovalRequestRow, reviewer_user_ids: Sequence[str]) -> App
         created_at=_as_utc(row.created_at),
         updated_at=_as_utc(row.updated_at),
         decided_by_user_id=row.decided_by_user_id,
-        decided_at=_as_utc(row.decided_at),
+        decided_at=_as_utc_or_none(row.decided_at),
         decision_comment=row.decision_comment,
         decision_reason=row.decision_reason,
     )

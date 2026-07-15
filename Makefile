@@ -1,4 +1,4 @@
-.PHONY: install run test lint format docker-up docker-down docker-logs docker-build
+.PHONY: install run test lint format typecheck docker-up docker-down docker-logs docker-build
 
 install:
 	uv sync
@@ -14,6 +14,9 @@ lint:
 
 format:
 	uv run ruff format .
+
+typecheck:
+	uv run mypy
 
 docker-build:
 	docker compose build
