@@ -46,7 +46,10 @@ async def test_create_writes_audit_log_and_outbox_event() -> None:
         response = await ac.post(
             "/api/v1/workspaces/ws_1/approval-requests",
             json=BASE_PAYLOAD,
-            headers=auth_headers(workspace_id="ws_1", actions=["approval:create"]),
+            headers={
+                **auth_headers(workspace_id="ws_1", actions=["approval:create"]),
+                "Idempotency-Key": "test-audit-log-key",
+            },
         )
     assert response.status_code == 201, response.text
     body = response.json()
@@ -133,12 +136,24 @@ def test_create_rejects_duplicate_reviewer_ids(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_create_rejects_blank_reviewer_id(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/workspaces/ws_1/approval-requests",
+        json={**BASE_PAYLOAD, "reviewerUserIds": ["usr_1", "   "]},
+        headers=auth_headers(workspace_id="ws_1", actions=["approval:create"]),
+    )
+    assert response.status_code == 422
+
+
 def test_create_defaults_reviewer_user_ids_to_empty_list(client: TestClient) -> None:
     payload = {k: v for k, v in BASE_PAYLOAD.items() if k != "reviewerUserIds"}
     response = client.post(
         "/api/v1/workspaces/ws_1/approval-requests",
         json=payload,
-        headers=auth_headers(workspace_id="ws_1", actions=["approval:create"]),
+        headers={
+            **auth_headers(workspace_id="ws_1", actions=["approval:create"]),
+            "Idempotency-Key": "test-no-reviewers-key",
+        },
     )
     assert response.status_code == 201
     assert response.json()["reviewerUserIds"] == []
@@ -262,6 +277,22 @@ def test_list_rejects_invalid_status(client: TestClient) -> None:
 def test_list_rejects_out_of_range_limit(client: TestClient) -> None:
     response = client.get(
         "/api/v1/workspaces/ws_1/approval-requests?limit=101",
+        headers=auth_headers(workspace_id="ws_1", actions=["approval:read"]),
+    )
+    assert response.status_code == 422
+
+
+def test_list_rejects_zero_limit(client: TestClient) -> None:
+    response = client.get(
+        "/api/v1/workspaces/ws_1/approval-requests?limit=0",
+        headers=auth_headers(workspace_id="ws_1", actions=["approval:read"]),
+    )
+    assert response.status_code == 422
+
+
+def test_list_rejects_negative_offset(client: TestClient) -> None:
+    response = client.get(
+        "/api/v1/workspaces/ws_1/approval-requests?offset=-1",
         headers=auth_headers(workspace_id="ws_1", actions=["approval:read"]),
     )
     assert response.status_code == 422

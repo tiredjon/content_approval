@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # Zero-friction default for bare `make run`; docker-compose (Phase 8) points this at
     # Postgres instead, and tests override it to an in-memory SQLite DB (see conftest.py).
     database_url: str = "sqlite+aiosqlite:///./approval_service.db"
+    log_level: str = "INFO"
 
 
 @lru_cache

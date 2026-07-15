@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -6,6 +7,8 @@ from app.domain.enums import ApprovalStatus, AuditAction, OutboxEventType, Sourc
 from app.domain.exceptions import ApprovalRequestNotFoundError, NotAuthorizedForDecisionError
 from app.domain.ids import generate_id
 from app.domain.repository import ApprovalRequestRepository
+
+logger = logging.getLogger(__name__)
 
 
 class ApprovalService:
@@ -59,6 +62,16 @@ class ApprovalService:
                 "source_id": source_id,
                 "status": request.status.value,
                 "reviewer_user_ids": list(reviewer_user_ids),
+            },
+        )
+        logger.info(
+            "approval request created",
+            extra={
+                "context": {
+                    "workspace_id": workspace_id,
+                    "request_id": request_id,
+                    "actor_user_id": created_by_user_id,
+                }
             },
         )
         return request
@@ -206,6 +219,18 @@ class ApprovalService:
                 "workspace_id": workspace_id,
                 "status": updated.status.value,
                 "decided_by_user_id": actor_user_id,
+            },
+        )
+        logger.info(
+            "approval request %s",
+            audit_action.value,
+            extra={
+                "context": {
+                    "workspace_id": workspace_id,
+                    "request_id": request_id,
+                    "actor_user_id": actor_user_id,
+                    "new_status": updated.status.value,
+                }
             },
         )
         return updated

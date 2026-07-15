@@ -76,13 +76,42 @@ work, and update it (plus the architecture/decisions sections) after every meani
       already-loaded ORM object in sync after the bulk `UPDATE`, so re-fetching in the same session
       never returns stale data; (2) two decisions fired concurrently via `asyncio.gather` against the
       single-connection SQLite StaticPool resolve to exactly one `200` and one `409`, never an error.
-- [ ] **Phase 5 — Idempotency & error handling**: shared `Idempotency-Key` handling for all mutating
-      endpoints (dedupe by workspace+route+key+body-hash, conflict on reuse with a different body),
-      RFC 7807 problem-details error responses.
-- [ ] **Phase 6 — Observability & security hardening**: structured JSON logging with a redaction
-      processor, request/correlation id middleware.
-- [ ] **Phase 7 — Tests**: full suite — state machine edge cases, workspace isolation, idempotency,
-      auth/authorization, concurrent-decision race.
+- [x] **Phase 5 — Idempotency & error handling**: `run_idempotent()` (`app/api/idempotency.py`) — required
+      `Idempotency-Key` on create, optional on approve/reject/cancel; replays on same key+body, `409` on
+      same key+different body, `409` (not a crash) on a genuine concurrent-same-key race. Global RFC 7807
+      handlers (`app/api/errors.py`) replaced the Phase 4 per-router `_map_domain_errors()` — now cover
+      `HTTPException` (incl. existing auth 401/403), `RequestValidationError` (422, `ctx` stripped since
+      it can hold a raw non-JSON-serializable exception for custom validators), the 3 domain exceptions
+      (404/403/409), and a catch-all `Exception` → 500 that logs full details server-side only.
+- [x] **Phase 6 — Observability & security hardening**: `app/observability/` — `JSONFormatter` (stdlib
+      `logging`, one JSON object per line, redacts sensitive-looking field names), `RequestIdMiddleware`
+      (echoes/mints `X-Request-Id`, exposed to logs via a contextvar), `redaction.py` shared by both the
+      logger and the 422 handler. `ApprovalService` logs INFO on every successful mutation; auth
+      dependencies log WARNING on 401/403 (never the raw `Authorization` value). Done together with
+      Phase 5 per explicit request. Verified: 90 tests passing (23 new — idempotency replay/conflict/
+      concurrency, RFC 7807 shape for 401/403/404/409/422/500, request-id generation/echo, and a
+      caplog-based test that a real bearer token value never appears in log output), ruff clean.
+- [x] **Phase 7 — Test suite audit**: re-read the assignment's 6 constraints one by one against actual
+      coverage (not a rewrite — 90 tests already existed from Phases 2-6). Gaps found and closed, all in
+      `tests/test_decisions.py` unless noted: reject/cancel had no cross-workspace-404 test (only approve
+      did) → added both; reject/cancel had no audit-log/outbox-event test (only create/approve did) →
+      added both, refactored the duplicated async create-then-decide-then-fetch-trail setup into one
+      `_create_and_decide()` helper used by all three; "one-way final state" was only tested as
+      same-action-twice for reject/cancel (approve alone had the full matrix) → added
+      reject-after-approved and cancel-after-rejected; `reviewerUserIds` validation only covered
+      duplicates, not blank entries → added (`test_approval_requests.py`); pagination validation only
+      covered over-limit, not `limit=0`/negative `offset` → added (`test_approval_requests.py`); approve's
+      `comment` being optional was never tested with the key fully *omitted* (vs. `null`) → added; no
+      regression test existed for constraint #6 on the events/audit side specifically (logging was
+      already covered in Phase 6) → new `tests/test_no_sensitive_data_leakage.py`, one static check
+      (response schema field names) and one dynamic check (audit/outbox rows across a
+      create+approve+reject+cancel run) against `looks_sensitive()`. Also resolved Phase 0's open
+      `httpx2` follow-up: it's a real package, but migrating is a dependency upgrade with an unknown API
+      surface, not a coverage gap — deferred as a deliberate decision, not an oversight, since it's only
+      a deprecation warning and all 102 tests pass either way. Postgres-backed concurrency verification
+      (noted as a maybe) deferred to whenever Phase 8's docker-compose exists, since it's not needed to
+      close a gap — the SQLite-caveat is already fully documented. Verified: 102 tests passing (12 new),
+      ruff clean.
 - [ ] **Phase 8 — Docker**: multi-stage `Dockerfile`, `docker-compose.yml` (app + Postgres), migrate-then-serve
       entrypoint.
 - [ ] **Phase 9 — Docs**: final `README.md` (run/test commands, auth format, API examples), `DESIGN.md`
@@ -93,10 +122,10 @@ work, and update it (plus the architecture/decisions sections) after every meani
 Work one phase at a time; do not jump ahead. Stop and hand control back after finishing a phase rather
 than silently continuing into the next one.
 
-**Follow-up noted during Phase 0**: `TestClient` (via `starlette.testclient`) emits a
-`StarletteDeprecationWarning` recommending `httpx2` instead of `httpx` on the currently installed
-versions (fastapi 0.139, starlette 1.3.1, httpx 0.28.1). Harmless for now (tests pass), but re-check
-before building out the Phase 7 test suite in case `httpx2` becomes a required dev dependency.
+**Resolved during Phase 7**: the `httpx2`/`StarletteDeprecationWarning` noted since Phase 0 is a real,
+published package, but adopting it is a dependency upgrade with an unreviewed API surface, not a test
+gap — deliberately deferred rather than migrated. All 102 tests pass either way; revisit only if a future
+starlette/fastapi upgrade actually drops `httpx` support (not just warns about it).
 
 ## Commands
 
@@ -125,19 +154,23 @@ testable without HTTP or a real database:
 
 ```
 app/
-  main.py           FastAPI app factory, route registration, /health + /ready, mounts the router
-  config.py         Settings (pydantic-settings, env-driven)
+  main.py           FastAPI app factory: configure_logging(), RequestIdMiddleware, router, exception
+                     handlers, /health + /ready, startup log line
+  config.py         Settings (pydantic-settings, env-driven), incl. log_level
   api/
     deps.py          get_approval_service (wires SqlApprovalRequestRepository to the request's session)
+    errors.py        register_exception_handlers() — RFC 7807 for HTTPException,
+                      RequestValidationError, the 3 domain exceptions, and a catch-all 500
+    idempotency.py   run_idempotent() + fingerprint() — the Idempotency-Key mechanism
     v1/
-      approval_requests.py   create/list/get/approve/reject/cancel routes;
-                              _map_domain_errors() maps domain exceptions -> 404/403/409
+      approval_requests.py   create/list/get/approve/reject/cancel routes
   auth/
     models.py        Action (StrEnum), Principal (frozen pydantic model, has_action())
     exceptions.py    AuthError, InvalidCredentialsError
     provider.py      AuthProvider ABC
     stub.py          StubAuthProvider (Bearer <base64url(json)> decoder), encode_bearer_token()
-    dependencies.py  get_principal, require_action(action) + require_read/create/decide/cancel
+    dependencies.py  get_principal, require_action(action) + require_read/create/decide/cancel;
+                      logs WARNING on 401/403 (never the raw Authorization value)
   domain/
     enums.py         SourceType, ApprovalStatus (.is_final), AuditAction, OutboxEventType —
                       framework-agnostic
@@ -147,7 +180,8 @@ app/
                       NotAuthorizedForDecisionError
     repository.py    ApprovalRequestRepository ABC — the "port" (incl. transition()); no SQLAlchemy
     service.py       ApprovalService: create/get/list_request(s) + approve/reject/cancel_request —
-                      takes the port + plain scalar args, never a Principal or an API schema
+                      takes the port + plain scalar args, never a Principal or an API schema; logs
+                      INFO on every successful mutation
   db/
     base.py          Declarative Base + naming convention (stable constraint names for Alembic)
     models.py        ORM rows: ApprovalRequest, ApprovalRequestReviewer, AuditLogEntry, OutboxEvent,
@@ -159,6 +193,11 @@ app/
     common.py        CamelModel (alias_generator=to_camel, populate_by_name, from_attributes)
     approval_request.py   ApprovalRequestCreate/Out/ListOut, ApproveRequest,
                            DecisionReasonRequest -> RejectRequest/CancelRequest
+  observability/
+    context.py       request_id_var (contextvar) — set by the middleware, read by the formatter
+    redaction.py      looks_sensitive()/redact_mapping() — shared by logging.py and api/errors.py
+    logging.py        JSONFormatter, configure_logging()
+    middleware.py      RequestIdMiddleware — echoes/mints X-Request-Id
 tests/
   helpers.py         auth_headers(), create_approval_request() — shared across test files
 migrations/          Alembic (async env.py), versions/1fe27f129dda_initial_schema.py
@@ -179,9 +218,33 @@ is the only place that knows about SQL.
 - **State transitions via conditional UPDATE** (`UPDATE ... WHERE id = ? AND status = 'pending'`, check
   rowcount) rather than a row lock — avoids races between concurrent approve/reject/cancel calls without
   holding transactions open.
-- **Idempotency-Key is a first-class header**, checked generically for every mutating endpoint (create,
-  approve, reject, cancel): same key + same body → replay the stored response; same key + different body
-  → 409. Scoped per workspace + route so keys can't collide across tenants or endpoints.
+- **Idempotency-Key: required for create, optional for decisions** — revised from the original plan
+  ("required for every mutating endpoint") once Phase 4's state machine existed: create is the only
+  operation where skipping it lets a retry create a real, visible duplicate; approve/reject/cancel are
+  already retry-safe via the conditional `UPDATE` (a bare retry just gets `409`), so the key there is a
+  UX upgrade (clean replay instead of `409`) rather than a correctness requirement. Same key + same body
+  → replay the stored response, not re-run; same key + different body → 409. Scoped per
+  `(workspace_id, route, idempotency_key)` — `route` is an app-built logical key (`"create"`,
+  `f"approve:{request_id}"`, ...), not the literal HTTP path, so keys can't collide across tenants,
+  endpoints, or resources.
+- **Idempotency storage lives in the same transaction as the mutation** (`run_idempotent()` in
+  `app/api/idempotency.py`, called with the same `session` the route's service call uses — verified via
+  FastAPI's dependency caching, which resolves `Depends(get_db)` once per request regardless of how many
+  places declare it). The idempotency-key row is inserted and explicitly `flush()`-ed *inside* the
+  handler, specifically so an `IntegrityError` from a genuine concurrent-same-key race is caught right
+  there and turned into `409` — letting it surface later at the transaction's implicit commit (outside
+  the route's own control flow) would be much harder to handle cleanly.
+- **Concurrent identical-idempotency-key requests: verified, with a documented SQLite-only caveat.**
+  Isolated (just the idempotency-key insert, nothing else), two concurrent attempts behave exactly as
+  designed — one succeeds, the other gets a real `IntegrityError` → `409`. Through the full HTTP endpoint
+  (extra flushes from `create_request`'s own DB round-trip in between), the same test against the SQLite
+  `StaticPool` test harness instead produces `409` for *both* attempts, with zero rows surviving — safe
+  (no duplicate, no 500) but not the idealized "one clean winner" story. This traces to `StaticPool`
+  sharing one literal DBAPI connection across sessions, which SQLAlchemy documents as intended for
+  single-owner test scenarios, not genuinely concurrent transactions — not a flaw in the mechanism, which
+  targets Postgres (real per-connection isolation) in production. `tests/test_idempotency.py` asserts the
+  property that holds on *any* backend (never a duplicate, never a 500), not the exact status-code split.
+  Revisit once Phase 8's docker-compose Postgres exists, per Phase 7's note.
 - **Auth stub shape**: `Authorization: Bearer <base64url(json)>` where the JSON is
   `{"workspace_id", "user_id", "actions": [...]}`. Chosen over plain custom headers so the code path looks
   like real bearer-token auth and `StubAuthProvider` can be swapped for a real verifier later without
@@ -277,12 +340,46 @@ is the only place that knows about SQL.
   concurrently via `asyncio.gather` against the single-connection SQLite `StaticPool` resolves cleanly to
   one `200` and one `409`, never a connection-contention error. Both are exercised as real tests, not
   just asserted.
-- **Shared exception-to-HTTP mapping**: `_map_domain_errors()` in `app/api/v1/approval_requests.py` is a
-  small `contextmanager`, not a global FastAPI exception handler — used at all 4 mutating/read routes
-  that can raise domain exceptions (get/approve/reject/cancel) to avoid repeating the same three
-  `except` clauses four times. A real global handler (covering auth errors too, in RFC 7807 format) is
-  Phase 5's job; building that machinery now, before Phase 5's idempotency errors exist too, would mean
-  redoing it almost immediately.
+- **Exception-to-HTTP mapping evolved from a local helper to global handlers, as planned.** Phase 4 used
+  a small `_map_domain_errors()` contextmanager in `approval_requests.py` (documented then as a stopgap
+  until Phase 5's idempotency errors existed too). Phase 5 replaced it with `register_exception_handlers()`
+  (`app/api/errors.py`) — `@app.exception_handler(...)` for `HTTPException` (catches every existing inline
+  `HTTPException` raise, including auth's 401/403, for free), `RequestValidationError`, the 3 domain
+  exceptions, and a catch-all `Exception` → 500. Routes now just call the service directly; nothing in
+  `app/api/v1/approval_requests.py` catches exceptions itself anymore.
+- **RFC 7807 (`application/problem+json`) for every error, uniformly** — `{type, title, status, detail}`,
+  `422` adds an `errors` array. Two things the tests caught that would otherwise have shipped as bugs:
+  (1) Pydantic's `exc.errors()` puts the *raw exception object* in `ctx.error` for custom
+  `@field_validator`s (e.g. our blank-string checks) — passing that straight to `JSONResponse` raised
+  `TypeError: Object of type ValueError is not JSON serializable` the first time a blank-title test hit
+  the new handler; fixed by stripping `ctx` entirely (`msg` already has the resolved text, and `ctx` isn't
+  meant for API consumers anyway). (2) The unhandled-exception handler must log full details server-side
+  (`logger.exception(...)`) but return a body with *zero* internals — verified with a test that
+  monkeypatches a service method to raise and asserts the exception's message never appears in the
+  response (constraint #6: no internals in public responses).
+- **Structured logging: stdlib `logging` + a custom `JSONFormatter`, no new dependency** (not `structlog`
+  or similar) — one JSON object per line (timestamp/level/logger/message/request_id/exc_info), keeping
+  the dependency list unchanged for something this codebase's log volume doesn't need a dedicated library
+  for. `configure_logging()` replaces `root.handlers` once at app startup; call sites just use
+  `logging.getLogger(__name__)` — `domain/service.py` using it doesn't violate "no FastAPI/SQLAlchemy in
+  domain/" since `logging` is stdlib, not a web/ORM framework concern.
+- **One redaction utility (`app/observability/redaction.py`), used by both the logger and the 422
+  handler** — rather than duplicating the sensitive-key-marker list in two places. Substring match,
+  case-insensitive, deliberately broad (catches `signedUrl`, `storage_key`, `providerUrl`, ...) — this
+  service never actually handles secrets/tokens/emails/storage keys/signed URLs/provider URLs directly
+  (external systems are referenced by opaque id only, per the assignment's own scoping), so today this is
+  belt-and-suspenders defense-in-depth rather than something that fires in normal operation; it exists so
+  a future field that *does* carry something sensitive is caught by construction instead of by someone
+  remembering to redact it by hand.
+- **Correlation id via `contextvars`, not thread-locals or explicit threading** — `RequestIdMiddleware`
+  sets a `ContextVar` for the duration of each request; `JSONFormatter` reads it when formatting *any* log
+  record, so code arbitrarily deep in the call stack (e.g. `ApprovalService`) gets automatic correlation
+  without threading a `request_id` parameter through every function signature. Contextvars are the
+  correct primitive here (unlike thread-locals) because they follow asyncio task boundaries correctly.
+- **`X-Request-Id`: echo if provided, mint if not.** Letting a caller supply their own id (rather than
+  always generating a fresh one) lets a request be traced end-to-end across service boundaries in a
+  larger system, which matches constraint #5's "ready for integration" spirit even outside the
+  events/outbox mechanism specifically.
 - **`OutboxEventType` centralized once it had ≥2 real uses**: Phase 3 used a single literal string
   (`"approval_request.created"`) since introducing an enum for one value would've been premature; Phase
   4 added three more (`.approved`/`.rejected`/`.cancelled`), at which point the duplication/typo risk

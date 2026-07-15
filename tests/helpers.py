@@ -1,3 +1,4 @@
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -30,15 +31,20 @@ def create_approval_request(
     *,
     workspace_id: str = "ws_1",
     created_by_user_id: str = "usr_1",
+    idempotency_key: str | None = None,
     **overrides: Any,
 ) -> dict[str, Any]:
     payload = {**DEFAULT_APPROVAL_REQUEST_PAYLOAD, **overrides}
+    headers = auth_headers(
+        workspace_id=workspace_id, user_id=created_by_user_id, actions=["approval:create"]
+    )
+    # A fresh key per call by default, so tests that don't care about idempotency
+    # (the vast majority) never accidentally collide with each other's keys.
+    headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
     response = client.post(
         f"/api/v1/workspaces/{workspace_id}/approval-requests",
         json=payload,
-        headers=auth_headers(
-            workspace_id=workspace_id, user_id=created_by_user_id, actions=["approval:create"]
-        ),
+        headers=headers,
     )
     assert response.status_code == 201, response.text
     return response.json()

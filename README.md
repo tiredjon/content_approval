@@ -2,8 +2,8 @@
 
 Backend service for approving content before publication. Built incrementally — see `CLAUDE.md` for the
 full design and progress checklist. This README grows into the final deliverable (run/test commands, API
-examples) as phases land; it currently reflects Phase 0-4 (bootstrap, data model, auth, create/read,
-approve/reject/cancel).
+examples) as phases land; it currently reflects Phase 0-6 (bootstrap, data model, auth, create/read,
+approve/reject/cancel, idempotency, error format, observability).
 
 ## Requirements
 
@@ -83,11 +83,12 @@ curl -H "Authorization: Bearer <token>" http://localhost:8000/api/v1/workspaces/
 All endpoints are scoped under `/api/v1/workspaces/{workspace_id}/approval-requests`. Request bodies and
 responses are camelCase JSON.
 
-**Create** (requires `approval:create`):
+**Create** (requires `approval:create` and an `Idempotency-Key` header):
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
   -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: <any-unique-string-per-attempt>" \
   -d '{
     "sourceType": "publication",
     "sourceId": "pub_123",
@@ -149,7 +150,47 @@ curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/ar_x
   -d '{"reason": "Draft was removed"}'
 ```
 
-All three: `404` if the request doesn't exist in this workspace, `403` if the caller isn't authorized to
-decide on this specific request, `409` if it has already reached a final state (approved/rejected/
-cancelled never transitions again — retrying an already-applied decision also returns `409` for now;
-safe retries land with idempotency support in a later phase).
+All three accept an optional `Idempotency-Key` header too (see below). All three: `404` if the request
+doesn't exist in this workspace, `403` if the caller isn't authorized to decide on this specific request,
+`409` if it has already reached a final state (approved/rejected/cancelled never transitions again).
+
+## Idempotency
+
+Retrying the same client request must never create a duplicate. `Idempotency-Key` is:
+
+- **Required** on `POST .../approval-requests` (create) — without one, a retry would create a second,
+  visibly duplicate resource, which is exactly what must never happen.
+- **Optional** on approve/reject/cancel — the state machine already makes retrying safe on its own (a
+  bare retry of an already-applied decision just gets `409`); the key upgrades that into a clean replay
+  of the original response instead.
+
+Behavior, scoped per `(workspace_id, endpoint, idempotency_key)`:
+
+- Same key + same request body → the original response is replayed (same status code and body), the
+  operation is **not** repeated.
+- Same key + a *different* request body → `409` (the key was reused for a different request — almost
+  certainly a client bug).
+- A key is never required to be globally unique — the same string can be reused across workspaces or
+  across different resources without colliding.
+
+## Errors
+
+Every error response (auth failures, validation errors, not-found, forbidden, conflict, and unexpected
+server errors) is `application/problem+json` ([RFC 7807](https://www.rfc-editor.org/rfc/rfc7807)):
+
+```json
+{"type": "about:blank", "title": "Not Found", "status": 404, "detail": "Approval request not found: ar_xxx"}
+```
+
+`422` validation errors additionally include an `errors` array (Pydantic's per-field error list). Server
+errors (`500`) never expose internal details (stack traces, exception messages) in the response — those
+go to the server-side log only.
+
+## Observability
+
+Every response carries an `X-Request-Id` header — either echoed back from the request if the caller sent
+one, or freshly generated. Logs are single-line JSON to stdout, each one tagged with the `request_id` of
+the request that produced it, so a specific call's full server-side story can be grepped out of the logs
+by that id. Log lines never contain secrets/tokens/emails/etc. — any field whose name looks sensitive
+(`password`, `token`, `authorization`, `email`, `storage_key`, `signed_url`, `provider_url`, ...) is
+redacted before being written, both in logs and in `422` validation error bodies.
