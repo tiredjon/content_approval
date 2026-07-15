@@ -64,8 +64,18 @@ work, and update it (plus the architecture/decisions sections) after every meani
       still clean after a schema fix (below). Two real bugs found and fixed by the tests
       themselves — see "Key design decisions": (1) `created_at` tie-breaking for list ordering,
       (2) naive-vs-aware datetime inconsistency between a freshly-created and a re-fetched row.
-- [ ] **Phase 4 — Decision flows**: approve/reject/cancel with atomic conditional-update state machine,
-      reviewer-only enforcement for approve/reject, audit log + outbox event per decision.
+- [x] **Phase 4 — Decision flows**: `ApprovalRequestRepository.transition()` — one conditional
+      `UPDATE ... WHERE status = 'pending'` (`app/db/repository.py`) — backs `ApprovalService`'s
+      `approve_request`/`reject_request`/`cancel_request` (`app/domain/service.py`). Reviewer-only
+      enforcement for approve/reject, creator-only enforcement for cancel (`NotAuthorizedForDecisionError`),
+      already-decided detection (`InvalidTransitionError`). Routes at `.../approve`, `.../reject`,
+      `.../cancel` (`app/api/v1/approval_requests.py`) via a shared `_map_domain_errors()` context
+      manager (404/403/409). Documented in README under "API". Verified: 67 tests passing (24 new in
+      `tests/test_decisions.py`, including a real concurrent-request race test), ruff clean. Confirmed
+      empirically before trusting it: (1) SQLAlchemy's `synchronize_session="auto"` correctly keeps an
+      already-loaded ORM object in sync after the bulk `UPDATE`, so re-fetching in the same session
+      never returns stale data; (2) two decisions fired concurrently via `asyncio.gather` against the
+      single-connection SQLite StaticPool resolve to exactly one `200` and one `409`, never an error.
 - [ ] **Phase 5 — Idempotency & error handling**: shared `Idempotency-Key` handling for all mutating
       endpoints (dedupe by workspace+route+key+body-hash, conflict on reuse with a different body),
       RFC 7807 problem-details error responses.
@@ -120,7 +130,8 @@ app/
   api/
     deps.py          get_approval_service (wires SqlApprovalRequestRepository to the request's session)
     v1/
-      approval_requests.py   create/list/get routes; [Phase 4] adds approve/reject/cancel here too
+      approval_requests.py   create/list/get/approve/reject/cancel routes;
+                              _map_domain_errors() maps domain exceptions -> 404/403/409
   auth/
     models.py        Action (StrEnum), Principal (frozen pydantic model, has_action())
     exceptions.py    AuthError, InvalidCredentialsError
@@ -128,25 +139,28 @@ app/
     stub.py          StubAuthProvider (Bearer <base64url(json)> decoder), encode_bearer_token()
     dependencies.py  get_principal, require_action(action) + require_read/create/decide/cancel
   domain/
-    enums.py         SourceType, ApprovalStatus (.is_final), AuditAction — framework-agnostic
+    enums.py         SourceType, ApprovalStatus (.is_final), AuditAction, OutboxEventType —
+                      framework-agnostic
     ids.py           generate_id(prefix) -> opaque prefixed id
     entities.py      ApprovalRequest — frozen dataclass, the only type services/routes pass around
-    exceptions.py    DomainError, ApprovalRequestNotFoundError
-    repository.py    ApprovalRequestRepository ABC — the "port"; no SQLAlchemy import
-    service.py       ApprovalService (create_request/get_request/list_requests) — takes the port +
-                      plain scalar args, never a Principal or an API schema
+    exceptions.py    DomainError, ApprovalRequestNotFoundError, InvalidTransitionError,
+                      NotAuthorizedForDecisionError
+    repository.py    ApprovalRequestRepository ABC — the "port" (incl. transition()); no SQLAlchemy
+    service.py       ApprovalService: create/get/list_request(s) + approve/reject/cancel_request —
+                      takes the port + plain scalar args, never a Principal or an API schema
   db/
     base.py          Declarative Base + naming convention (stable constraint names for Alembic)
     models.py        ORM rows: ApprovalRequest, ApprovalRequestReviewer, AuditLogEntry, OutboxEvent,
                       IdempotencyKey
-    repository.py    SqlApprovalRequestRepository — the "adapter" implementing domain/repository.py
+    repository.py    SqlApprovalRequestRepository — the "adapter"; transition() is one conditional
+                      UPDATE (WHERE status='pending') for atomic state changes
     session.py       async engine/session factory, get_db (one transaction per request), ping()
   schemas/
     common.py        CamelModel (alias_generator=to_camel, populate_by_name, from_attributes)
-    approval_request.py   ApprovalRequestCreate/Out/ListOut
-  events/            [Phase 4] Outbox writer / event payload shaping beyond the raw table
+    approval_request.py   ApprovalRequestCreate/Out/ListOut, ApproveRequest,
+                           DecisionReasonRequest -> RejectRequest/CancelRequest
 tests/
-  helpers.py         auth_headers() for building test Authorization headers
+  helpers.py         auth_headers(), create_approval_request() — shared across test files
 migrations/          Alembic (async env.py), versions/1fe27f129dda_initial_schema.py
 ```
 
@@ -184,10 +198,16 @@ is the only place that knows about SQL.
   approve/reject a *specific* request — the acting user must also be one of that request's
   `reviewerUserIds` (when the list is non-empty). This is a deliberate interpretation beyond the literal
   spec, documented as such in `DESIGN.md`, because ignoring the reviewer list would let any user with the
-  coarse permission decide any request in the workspace.
-- **Events**: no real broker. An `outbox_event` table is written in the same transaction as every
-  mutation; a `LoggingEventPublisher` stub stands in for a future real publisher. This satisfies
-  "ready for integration via events" without introducing infra the assignment says not to add.
+  coarse permission decide any request in the workspace. Same idea for cancel: `approval:cancel` alone
+  isn't enough — the actor must be the request's *creator*. A listed reviewer with `approval:cancel` in
+  their token still gets 403 on cancel; reviewers reject, only the submitter withdraws. Both rules raise
+  the same `NotAuthorizedForDecisionError` (403), parameterized with a human-readable reason.
+- **Events**: no real broker, and no publisher process either — deliberately out of scope (the
+  assignment explicitly says not to add real external services). The `outbox_events` table (one row
+  per mutation, same transaction, `published_at` nullable) *is* the "ready for integration" deliverable:
+  a future worker can poll `WHERE published_at IS NULL ORDER BY created_at` and publish to a real
+  broker without any change to the tables or the service that writes them. Note this as a known
+  compromise in `DESIGN.md` (Phase 9) rather than building an unused publisher stub now.
 - **Database, dev vs. test vs. prod**: `DATABASE_URL` defaults to a local SQLite file so `make run` works
   with zero external services; docker-compose (Phase 8) points it at Postgres instead; tests override it
   to `sqlite+aiosqlite:///:memory:` (see `tests/conftest.py`). Alembic migrations are hand-reviewed after
@@ -247,6 +267,26 @@ is the only place that knows about SQL.
   different depending on how you got it. Fixed once, at the ORM-row → domain-entity boundary
   (`_as_utc` in `app/db/repository.py`), so the domain entity's invariant is "all datetimes are UTC-aware,"
   and every consumer (schemas, future event payloads) gets that for free.
+- **`transition()`'s atomicity, verified not assumed**: the conditional `UPDATE ... WHERE status =
+  'pending'` is the entire concurrency-safety mechanism for approve/reject/cancel — no row locks, no
+  `SELECT ... FOR UPDATE`. Two things had to be checked empirically rather than trusted from memory
+  before relying on this: (1) SQLAlchemy's ORM-enabled bulk `UPDATE` defaults to
+  `synchronize_session="auto"`, which (for this simple equality `WHERE` clause) updates any
+  already-loaded in-session object's attributes in place — so a `get()` called right after `transition()`
+  in the *same* session correctly sees the new state, not a stale cached one; (2) firing two decisions
+  concurrently via `asyncio.gather` against the single-connection SQLite `StaticPool` resolves cleanly to
+  one `200` and one `409`, never a connection-contention error. Both are exercised as real tests, not
+  just asserted.
+- **Shared exception-to-HTTP mapping**: `_map_domain_errors()` in `app/api/v1/approval_requests.py` is a
+  small `contextmanager`, not a global FastAPI exception handler — used at all 4 mutating/read routes
+  that can raise domain exceptions (get/approve/reject/cancel) to avoid repeating the same three
+  `except` clauses four times. A real global handler (covering auth errors too, in RFC 7807 format) is
+  Phase 5's job; building that machinery now, before Phase 5's idempotency errors exist too, would mean
+  redoing it almost immediately.
+- **`OutboxEventType` centralized once it had ≥2 real uses**: Phase 3 used a single literal string
+  (`"approval_request.created"`) since introducing an enum for one value would've been premature; Phase
+  4 added three more (`.approved`/`.rejected`/`.cancelled`), at which point the duplication/typo risk
+  became real, so all four now live in `app/domain/enums.py`.
 
 ## Conventions
 

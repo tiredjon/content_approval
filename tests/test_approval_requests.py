@@ -8,32 +8,15 @@ from sqlalchemy import select
 from app.db.models import AuditLogEntry, OutboxEvent
 from app.db.session import get_sessionmaker
 from app.main import app
+from tests.helpers import DEFAULT_APPROVAL_REQUEST_PAYLOAD as BASE_PAYLOAD
 from tests.helpers import auth_headers
-
-BASE_PAYLOAD = {
-    "sourceType": "publication",
-    "sourceId": "pub_123",
-    "title": "Instagram reel draft",
-    "description": "Needs final approval",
-    "reviewerUserIds": ["usr_1", "usr_2"],
-}
+from tests.helpers import create_approval_request as _create
 
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
     with TestClient(app) as c:
         yield c
-
-
-def _create(client: TestClient, workspace_id: str = "ws_1", **overrides) -> dict:
-    payload = {**BASE_PAYLOAD, **overrides}
-    response = client.post(
-        f"/api/v1/workspaces/{workspace_id}/approval-requests",
-        json=payload,
-        headers=auth_headers(workspace_id=workspace_id, actions=["approval:create"]),
-    )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 # --- create --------------------------------------------------------------------------

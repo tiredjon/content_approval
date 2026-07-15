@@ -32,6 +32,26 @@ class ApprovalRequestRepository(ABC):
     async def get(self, *, workspace_id: str, request_id: str) -> ApprovalRequest | None: ...
 
     @abstractmethod
+    async def transition(
+        self,
+        *,
+        workspace_id: str,
+        request_id: str,
+        new_status: ApprovalStatus,
+        decided_by_user_id: str,
+        decision_comment: str | None,
+        decision_reason: str | None,
+    ) -> ApprovalRequest:
+        """Atomically move a *pending* request to a final state.
+
+        Must be implemented as a single conditional UPDATE (`WHERE status = 'pending'`)
+        so two concurrent decisions on the same request can't both succeed. Raises
+        `ApprovalRequestNotFoundError` if the request doesn't exist in this workspace,
+        or `InvalidTransitionError` if it's already in a final state.
+        """
+        ...
+
+    @abstractmethod
     async def list(
         self,
         *,

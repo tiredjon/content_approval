@@ -2,7 +2,8 @@
 
 Backend service for approving content before publication. Built incrementally — see `CLAUDE.md` for the
 full design and progress checklist. This README grows into the final deliverable (run/test commands, API
-examples) as phases land; it currently reflects Phase 0-3 (bootstrap, data model, auth, create/read).
+examples) as phases land; it currently reflects Phase 0-4 (bootstrap, data model, auth, create/read,
+approve/reject/cancel).
 
 ## Requirements
 
@@ -80,8 +81,7 @@ curl -H "Authorization: Bearer <token>" http://localhost:8000/api/v1/workspaces/
 ## API
 
 All endpoints are scoped under `/api/v1/workspaces/{workspace_id}/approval-requests`. Request bodies and
-responses are camelCase JSON. Implemented so far: create, list, get one (approve/reject/cancel land in a
-later phase).
+responses are camelCase JSON.
 
 **Create** (requires `approval:create`):
 
@@ -120,3 +120,36 @@ curl http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/ar_xxx \
 
 Returns `404` if the id doesn't exist *or* belongs to a different workspace — the response never reveals
 whether a request exists in someone else's workspace.
+
+**Approve** (requires `approval:decide`, and — if `reviewerUserIds` was non-empty at creation — the
+caller must be one of them):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/ar_xxx/approve \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"comment": "Approved"}'
+```
+
+`comment` is optional. Returns the updated request (`status: "approved"`).
+
+**Reject** (same `approval:decide` + reviewer rule as approve; `reason` is required):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/ar_xxx/reject \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"reason": "Brand tone is wrong"}'
+```
+
+**Cancel** (requires `approval:cancel`, **and the caller must be the request's creator** — being a
+reviewer is not enough; `reason` is required):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/ar_xxx/cancel \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"reason": "Draft was removed"}'
+```
+
+All three: `404` if the request doesn't exist in this workspace, `403` if the caller isn't authorized to
+decide on this specific request, `409` if it has already reached a final state (approved/rejected/
+cancelled never transitions again — retrying an already-applied decision also returns `409` for now;
+safe retries land with idempotency support in a later phase).

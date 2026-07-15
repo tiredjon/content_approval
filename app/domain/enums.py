@@ -24,3 +24,10 @@ class AuditAction(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     CANCELLED = "cancelled"
+
+
+class OutboxEventType(StrEnum):
+    APPROVAL_REQUEST_CREATED = "approval_request.created"
+    APPROVAL_REQUEST_APPROVED = "approval_request.approved"
+    APPROVAL_REQUEST_REJECTED = "approval_request.rejected"
+    APPROVAL_REQUEST_CANCELLED = "approval_request.cancelled"

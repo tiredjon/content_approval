@@ -55,3 +55,27 @@ class ApprovalRequestListOut(CamelModel):
     total: int
     limit: int
     offset: int
+
+
+class ApproveRequest(CamelModel):
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class DecisionReasonRequest(CamelModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_and_require_non_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class RejectRequest(DecisionReasonRequest):
+    pass
+
+
+class CancelRequest(DecisionReasonRequest):
+    pass

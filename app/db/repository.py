@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -10,6 +10,7 @@ from app.db.models import ApprovalRequest as ApprovalRequestRow
 from app.db.models import ApprovalRequestReviewer, AuditLogEntry, OutboxEvent
 from app.domain.entities import ApprovalRequest
 from app.domain.enums import ApprovalStatus, AuditAction, SourceType
+from app.domain.exceptions import ApprovalRequestNotFoundError, InvalidTransitionError
 from app.domain.ids import generate_id
 from app.domain.repository import ApprovalRequestRepository
 
@@ -65,6 +66,46 @@ class SqlApprovalRequestRepository(ApprovalRequestRepository):
         if row is None:
             return None
         return _to_entity(row, [r.reviewer_user_id for r in row.reviewers])
+
+    async def transition(
+        self,
+        *,
+        workspace_id: str,
+        request_id: str,
+        new_status: ApprovalStatus,
+        decided_by_user_id: str,
+        decision_comment: str | None,
+        decision_reason: str | None,
+    ) -> ApprovalRequest:
+        now = datetime.now(UTC)
+        stmt = (
+            update(ApprovalRequestRow)
+            .where(
+                ApprovalRequestRow.workspace_id == workspace_id,
+                ApprovalRequestRow.id == request_id,
+                ApprovalRequestRow.status == ApprovalStatus.PENDING,
+            )
+            .values(
+                status=new_status,
+                decided_by_user_id=decided_by_user_id,
+                decided_at=now,
+                decision_comment=decision_comment,
+                decision_reason=decision_reason,
+                updated_at=now,
+            )
+        )
+        result = await self._session.execute(stmt)
+
+        if result.rowcount == 1:
+            updated = await self.get(workspace_id=workspace_id, request_id=request_id)
+            if updated is None:  # pragma: no cover - would mean rows vanish mid-transaction
+                raise RuntimeError(f"request {request_id} vanished right after transition")
+            return updated
+
+        current = await self.get(workspace_id=workspace_id, request_id=request_id)
+        if current is None:
+            raise ApprovalRequestNotFoundError(request_id)
+        raise InvalidTransitionError(request_id=request_id, current_status=current.status)
 
     async def list(
         self,
