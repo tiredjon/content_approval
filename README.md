@@ -2,7 +2,7 @@
 
 Backend service for approving content before publication. Built incrementally — see `CLAUDE.md` for the
 full design and progress checklist. This README grows into the final deliverable (run/test commands, API
-examples) as phases land; it currently reflects Phase 0-2 (bootstrap, data model, auth).
+examples) as phases land; it currently reflects Phase 0-3 (bootstrap, data model, auth, create/read).
 
 ## Requirements
 
@@ -11,13 +11,14 @@ examples) as phases land; it currently reflects Phase 0-2 (bootstrap, data model
 ## Run
 
 ```bash
-make install   # uv sync
-make run       # uvicorn app.main:app --reload, http://localhost:8000
+make install                  # uv sync
+uv run alembic upgrade head   # create the schema (local SQLite file by default)
+make run                      # uvicorn app.main:app --reload, http://localhost:8000
 ```
 
-Currently exposes `GET /health` (liveness) and `GET /ready` (checks DB connectivity — 503 if the
-database is unreachable). By default the app points at a local SQLite file, so this works with no other
-services running.
+Exposes `GET /health` (liveness) and `GET /ready` (checks DB connectivity — 503 if the database is
+unreachable), plus the approval-requests endpoints below. By default the app points at a local SQLite
+file, so this works with no other services running.
 
 ## Test
 
@@ -75,3 +76,47 @@ Then use the printed value directly as the `Authorization` header, e.g.:
 ```bash
 curl -H "Authorization: Bearer <token>" http://localhost:8000/api/v1/workspaces/ws_1/approval-requests
 ```
+
+## API
+
+All endpoints are scoped under `/api/v1/workspaces/{workspace_id}/approval-requests`. Request bodies and
+responses are camelCase JSON. Implemented so far: create, list, get one (approve/reject/cancel land in a
+later phase).
+
+**Create** (requires `approval:create`):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{
+    "sourceType": "publication",
+    "sourceId": "pub_123",
+    "title": "Instagram reel draft",
+    "description": "Needs final approval",
+    "reviewerUserIds": ["usr_1", "usr_2"]
+  }'
+```
+
+`sourceType` is one of `publication`, `scenario`, `edit`, `external`. `reviewerUserIds` is optional
+(defaults to empty) and must not contain blanks or duplicates. Returns `201` with the created request
+(`status: "pending"`).
+
+**List** (requires `approval:read`), with optional `status` filter and `limit`/`offset` pagination
+(`limit` 1-100, default 20; newest first):
+
+```bash
+curl "http://localhost:8000/api/v1/workspaces/ws_1/approval-requests?status=pending&limit=20&offset=0" \
+  -H "Authorization: Bearer <token>"
+```
+
+Returns `{"items": [...], "total": N, "limit": 20, "offset": 0}`.
+
+**Get one** (requires `approval:read`):
+
+```bash
+curl http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/ar_xxx \
+  -H "Authorization: Bearer <token>"
+```
+
+Returns `404` if the id doesn't exist *or* belongs to a different workspace — the response never reveals
+whether a request exists in someone else's workspace.

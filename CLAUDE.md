@@ -54,8 +54,16 @@ work, and update it (plus the architecture/decisions sections) after every meani
       (`app/auth/dependencies.py`). Documented in README under "Auth (local stub)". Verified: 20 tests
       passing (17 new in `tests/test_auth.py` — provider edge cases + dependency integration on a
       throwaway probe app), ruff clean.
-- [ ] **Phase 3 — Create & read flows**: `ApprovalService.create`, `list`, `get`; repository layer;
-      Pydantic schemas; audit log + outbox event on create.
+- [x] **Phase 3 — Create & read flows**: domain entity + ports-and-adapters repository
+      (`app/domain/entities.py`, `repository.py`, `app/db/repository.py`), `ApprovalService`
+      (create/get/list, `app/domain/service.py`), camelCase Pydantic schemas
+      (`app/schemas/`), routes mounted at `/api/v1/workspaces/{workspace_id}/approval-requests`
+      (`app/api/v1/approval_requests.py`). `get_db` now wraps each request in one transaction
+      (`session.begin()`) so create + audit log + outbox event commit atomically. Documented in
+      README under "API". Verified: 43 tests passing, ruff clean, alembic upgrade/downgrade/check
+      still clean after a schema fix (below). Two real bugs found and fixed by the tests
+      themselves — see "Key design decisions": (1) `created_at` tie-breaking for list ordering,
+      (2) naive-vs-aware datetime inconsistency between a freshly-created and a re-fetched row.
 - [ ] **Phase 4 — Decision flows**: approve/reject/cancel with atomic conditional-update state machine,
       reviewer-only enforcement for approve/reject, audit log + outbox event per decision.
 - [ ] **Phase 5 — Idempotency & error handling**: shared `Idempotency-Key` handling for all mutating
@@ -107,9 +115,12 @@ testable without HTTP or a real database:
 
 ```
 app/
-  main.py           FastAPI app factory, route registration, startup/shutdown, /health + /ready
+  main.py           FastAPI app factory, route registration, /health + /ready, mounts the router
   config.py         Settings (pydantic-settings, env-driven)
-  api/               [Phase 3] HTTP layer: routers, request/response wiring, exception handlers
+  api/
+    deps.py          get_approval_service (wires SqlApprovalRequestRepository to the request's session)
+    v1/
+      approval_requests.py   create/list/get routes; [Phase 4] adds approve/reject/cancel here too
   auth/
     models.py        Action (StrEnum), Principal (frozen pydantic model, has_action())
     exceptions.py    AuthError, InvalidCredentialsError
@@ -119,16 +130,23 @@ app/
   domain/
     enums.py         SourceType, ApprovalStatus (.is_final), AuditAction — framework-agnostic
     ids.py           generate_id(prefix) -> opaque prefixed id
-    [Phase 3/4]       entities, state machine, domain exceptions, ApprovalService
+    entities.py      ApprovalRequest — frozen dataclass, the only type services/routes pass around
+    exceptions.py    DomainError, ApprovalRequestNotFoundError
+    repository.py    ApprovalRequestRepository ABC — the "port"; no SQLAlchemy import
+    service.py       ApprovalService (create_request/get_request/list_requests) — takes the port +
+                      plain scalar args, never a Principal or an API schema
   db/
     base.py          Declarative Base + naming convention (stable constraint names for Alembic)
-    models.py        ApprovalRequest, ApprovalRequestReviewer, AuditLogEntry, OutboxEvent,
+    models.py        ORM rows: ApprovalRequest, ApprovalRequestReviewer, AuditLogEntry, OutboxEvent,
                       IdempotencyKey
-    session.py       async engine/session factory, get_db dependency, ping() for /ready
-    [Phase 3/4]       repositories
-  schemas/           [Phase 3] Pydantic request/response models (never reuse ORM models as API schemas)
-  events/            [Phase 4] Outbox writer / event payload shaping
+    repository.py    SqlApprovalRequestRepository — the "adapter" implementing domain/repository.py
+    session.py       async engine/session factory, get_db (one transaction per request), ping()
+  schemas/
+    common.py        CamelModel (alias_generator=to_camel, populate_by_name, from_attributes)
+    approval_request.py   ApprovalRequestCreate/Out/ListOut
+  events/            [Phase 4] Outbox writer / event payload shaping beyond the raw table
 tests/
+  helpers.py         auth_headers() for building test Authorization headers
 migrations/          Alembic (async env.py), versions/1fe27f129dda_initial_schema.py
 ```
 
@@ -193,6 +211,42 @@ is the only place that knows about SQL.
   containment queries) on Postgres, portable plain `JSON` everywhere else including SQLite tests.
 - **`greenlet` is an explicit dependency**, not left implicit — SQLAlchemy's async engine raises at
   runtime ("the greenlet library is required...") without it; it doesn't always get pulled transitively.
+- **Ports and adapters for persistence**: `app/domain/repository.py` defines `ApprovalRequestRepository`
+  as an ABC (the port); `app/db/repository.py`'s `SqlApprovalRequestRepository` is the only adapter. Audit
+  log + outbox writes are methods on the *same* port/adapter (not split into separate repositories) since
+  in this codebase they always travel together with the state change they describe — splitting them would
+  be abstraction without a use case. `ApprovalService` depends only on the port, so its business logic
+  (and Phase 4's state machine) can be unit-tested against an in-memory fake without a database.
+- **Service methods take plain scalar ids, never a `Principal`**: e.g. `created_by_user_id: str`, not the
+  whole auth `Principal` object. `domain/` must not depend on `auth/` — coarse-grained authorization
+  (`require_action`) is checked at the API layer before the service is ever called; fine-grained business
+  rules that need identity (Phase 4's "must be a listed reviewer to decide") take just the actor's user id
+  and are pure domain logic, not an auth concern.
+- **One DB transaction per request**: `get_db()` wraps the session in `session.begin()`, so it commits
+  once when the route handler returns normally and rolls back on any exception. This is what makes
+  "insert approval_request + reviewers, then audit log, then outbox event" atomic without the service or
+  repository having to manage transaction boundaries themselves.
+- **List response is a `{items, total, limit, offset}` envelope**, not a bare array — the assignment
+  doesn't specify a shape, and returning an unbounded array with no pagination would be a real scalability
+  problem. Default `limit=20`, capped at 100; sorted newest-first (`created_at DESC, id DESC` tie-break).
+- **Cross-workspace lookups return 404, not 403**: `GET .../approval-requests/{id}` for a request that
+  belongs to a *different* workspace than the one in the URL is indistinguishable from a nonexistent id.
+  Returning 403 would leak "this id exists, just not for you," which is exactly the kind of cross-tenant
+  information leak constraint #1 rules out. (403 is still correct and used for the *auth* case — token's
+  workspace doesn't match the URL's workspace — since that's about the caller's credentials, not about
+  whether the target resource exists.)
+- **Timestamp precision bug (found by tests, fixed)**: columns originally used `server_default=func.now()`.
+  On SQLite this is second-granularity, so two rows created in the same test collided on `created_at`, and
+  since ids are random (not sortable), `ORDER BY created_at DESC, id DESC` silently stopped reflecting
+  insertion order. Fixed by switching every `created_at`/`updated_at` to a Python-side
+  `default=lambda: datetime.now(UTC)` (microsecond precision on every dialect) — required editing the
+  not-yet-deployed initial migration directly (see Conventions) rather than adding a second migration.
+- **Naive-vs-aware datetime bug (found by tests, fixed)**: SQLite drops `tzinfo` on round-trip through the
+  DB (Postgres doesn't), so a freshly-created row's in-memory object serialized `created_at` with a `Z`
+  suffix while the *same* row re-fetched via `GET` serialized it without one — the same resource looked
+  different depending on how you got it. Fixed once, at the ORM-row → domain-entity boundary
+  (`_as_utc` in `app/db/repository.py`), so the domain entity's invariant is "all datetimes are UTC-aware,"
+  and every consumer (schemas, future event payloads) gets that for free.
 
 ## Conventions
 
@@ -201,3 +255,7 @@ is the only place that knows about SQL.
 - Never return ORM models directly from routes; always go through a `schemas/` Pydantic model.
 - Every mutating service method writes its audit log entry and outbox event in the same DB transaction
   as the state change it describes — never as a separate best-effort step.
+- While a migration has never been applied anywhere outside this local checkout (i.e. no real environment
+  has run it), fix it in place and re-verify upgrade/downgrade/`alembic check` rather than stacking a
+  second migration on top. Once something is deployed, this no longer applies — new schema changes always
+  get a new migration.
