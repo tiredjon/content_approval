@@ -1,15 +1,37 @@
 # approval-service
 
-Backend service for approving content before publication. Built incrementally — see `CLAUDE.md` for the
-full design and progress checklist. This README grows into the final deliverable (run/test commands, API
-examples) as phases land; it currently reflects Phase 0-6 (bootstrap, data model, auth, create/read,
-approve/reject/cancel, idempotency, error format, observability).
+Backend service that accepts requests to approve content before publication and records the final
+decision, scoped per workspace. Publications, scenarios, users, and workspaces themselves live in other
+services and are referenced here only by opaque id.
+
+See [`DESIGN.md`](DESIGN.md) for the data model, service boundaries, retry/idempotency handling,
+events/integration readiness, and known compromises. See [`CLAUDE.md`](CLAUDE.md) for the full
+incremental build log, if you want the detailed rationale and the empirical checks behind specific
+decisions.
+
+**Contents:** [Requirements](#requirements) · [Run with Docker](#run-with-docker-postgres) ·
+[Run locally](#run-locally-with-uv-sqlite) · [Test](#test) · [Migrations](#database--migrations) ·
+[Auth](#auth-local-stub) · [API](#api) · [Idempotency](#idempotency) · [Errors](#errors) ·
+[Observability](#observability) · [Docker](#docker)
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/) (manages the Python 3.12 interpreter and virtualenv for you)
+- [uv](https://docs.astral.sh/uv/) (manages the Python 3.12 interpreter and virtualenv for you) — for
+  running locally without Docker
+- [Docker](https://docs.docker.com/get-docker/) + Docker Compose — for running via `docker compose up`
 
-## Run
+## Run with Docker (Postgres)
+
+```bash
+docker compose up --build
+```
+
+Builds the app image, starts Postgres, waits for it to be healthy, applies migrations, then starts the
+API at `http://localhost:8000`. This is the easiest way to run the service exactly as it would run in a
+real deployment (Postgres, not SQLite). `make docker-up` / `make docker-down` / `make docker-logs` are
+shortcuts for the same thing.
+
+## Run locally with uv (SQLite)
 
 ```bash
 make install                  # uv sync
@@ -28,6 +50,14 @@ make test      # uv run pytest
 make lint      # uv run ruff check .
 ```
 
+102 tests, all against an in-memory SQLite DB (fast, isolated per test — see `tests/conftest.py`) except
+where a test specifically needs a real async HTTP round-trip. Coverage includes the state machine's edge
+cases (every already-decided combination, not just repeats), workspace isolation (cross-workspace access
+returns `404` everywhere it's checked), idempotency (replay, conflict, and a real concurrent-request
+race), auth (every malformed-token shape, case-insensitive scheme, workspace/action mismatches), and a
+constraint-6 regression guard (audit/outbox rows and the response schema itself are checked for
+anything that looks like a secret).
+
 ## Database & migrations
 
 ```bash
@@ -35,8 +65,9 @@ uv run alembic upgrade head                        # apply migrations
 uv run alembic revision --autogenerate -m "..."     # generate a migration from model changes
 ```
 
-`DATABASE_URL` (env var `APPROVAL_DATABASE_URL`) defaults to a local SQLite file. docker-compose (coming
-in a later phase) will point it at Postgres instead.
+`DATABASE_URL` (env var `APPROVAL_DATABASE_URL`) defaults to a local SQLite file; `docker compose up`
+points it at the Postgres service instead (`docker-compose.yml`) and runs migrations automatically on
+container startup — no manual `alembic upgrade head` step needed there.
 
 ## Auth (local stub)
 
@@ -194,3 +225,23 @@ the request that produced it, so a specific call's full server-side story can be
 by that id. Log lines never contain secrets/tokens/emails/etc. — any field whose name looks sensitive
 (`password`, `token`, `authorization`, `email`, `storage_key`, `signed_url`, `provider_url`, ...) is
 redacted before being written, both in logs and in `422` validation error bodies.
+
+## Docker
+
+```bash
+docker compose up --build   # or: make docker-up
+```
+
+- `db`: `postgres:16-alpine`, with a named volume (`postgres_data`) so data survives restarts, and a
+  `pg_isready` healthcheck.
+- `app`: builds from the multi-stage `Dockerfile` (uv resolves and installs dependencies in a builder
+  stage; the final image is `python:3.12-slim-bookworm` with just the venv + app code, running as a
+  non-root user, uid 1000). Only starts once `db` reports healthy. `docker-entrypoint.sh` runs
+  `alembic upgrade head` then starts uvicorn — every container start is guaranteed to be running against
+  an up-to-date schema.
+- Connect to Postgres directly for debugging: `psql postgresql://approval:approval@localhost:5432/approval_service`
+  (the `db` service also publishes 5432 to the host).
+- `make docker-down` stops both containers; add `-v` (`docker compose down -v`) to also drop the
+  Postgres volume if you want a truly clean slate.
+- The image excludes `tests/` and dev tooling (`.dockerignore`) — it's a lean runtime image only.
+  Tests run locally via `uv run pytest`, not inside the container.

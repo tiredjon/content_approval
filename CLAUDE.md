@@ -112,10 +112,32 @@ work, and update it (plus the architecture/decisions sections) after every meani
       (noted as a maybe) deferred to whenever Phase 8's docker-compose exists, since it's not needed to
       close a gap — the SQLite-caveat is already fully documented. Verified: 102 tests passing (12 new),
       ruff clean.
-- [ ] **Phase 8 — Docker**: multi-stage `Dockerfile`, `docker-compose.yml` (app + Postgres), migrate-then-serve
-      entrypoint.
-- [ ] **Phase 9 — Docs**: final `README.md` (run/test commands, auth format, API examples), `DESIGN.md`
-      (data model, service boundaries, retry/idempotency handling, events/integration, known compromises).
+- [x] **Phase 8 — Docker**: multi-stage `Dockerfile` (uv builder stage installs deps then the project in
+      two layers for cache efficiency; `python:3.12-slim-bookworm` runtime stage, non-root `appuser`,
+      `HEALTHCHECK` hitting `/health`), `docker-entrypoint.sh` (`alembic upgrade head` then
+      `exec uvicorn`), `docker-compose.yml` (`postgres:16-alpine` with a named volume + `pg_isready`
+      healthcheck; `app` waits for `condition: service_healthy`). Verified end-to-end against the real
+      stack, not just reviewed: image builds clean; `docker compose up` brings up Postgres, waits for
+      healthy, runs migrations (`PostgresqlImpl`, not `SQLiteImpl` — the first time this project's
+      migration has ever touched real Postgres), starts the app; full create → get → list → approve/
+      cancel flow works over HTTP; container runs as uid 1000 (`appuser`), not root; cross-workspace
+      isolation and idempotency replay both still hold against Postgres; `uv run pytest` (102 tests)
+      still green while the stack was up. **A real, meaningful bug surfaced by this verification and
+      fixed** — see "Key design decisions": `native_enum=False` alone does not add a CHECK constraint
+      (needs `create_constraint=True` too), so every enum column had silently had *no* DB-level
+      validation since Phase 1 without SQLite ever being able to reveal it.
+- [x] **Phase 9 — Docs**: new `DESIGN.md` — data model (table purposes, the composite-FK tenant-isolation
+      trick, a mermaid state diagram), service boundaries (ownership vs. opaque-external-id references,
+      the 3-layer tenant isolation argument, the reviewer/creator authorization nuance), retry/idempotency
+      handling (required-vs-optional split, replay/conflict mechanics, the SQLite-StaticPool concurrent-
+      same-key caveat restated for a human reader), events/integration readiness (outbox pattern, minimal
+      payload rationale), and known compromises (stub auth, no audit-read endpoint, single worker,
+      offset pagination, SQLite-vs-Postgres migration caveat including the Phase 8 CHECK-constraint bug).
+      Written to stand alone for a reader who hasn't seen `CLAUDE.md`'s session-by-session log — distilled,
+      not copied. `README.md` polished: top-of-file links to `DESIGN.md`/`CLAUDE.md`, a table-of-contents
+      with hand-verified GitHub anchor links, a test-coverage summary in the Test section, one factual
+      fix (Docker section said `python:3.12-slim`, corrected to match the Dockerfile's actual
+      `python:3.12-slim-bookworm`).
 - [ ] **Phase 10 — Polish pass**: lint/type-check clean, re-read assignment against implementation for
       gaps.
 
@@ -145,7 +167,11 @@ uv run alembic revision --autogenerate -m "..."     # generate a migration from 
 uv run alembic check                                # fail if models.py and migrations have drifted
 ```
 
-(Docker/Postgres commands land in Phase 8.)
+```bash
+make docker-up      # docker compose up --build — real Postgres, migrations run automatically
+make docker-down     # docker compose down
+make docker-logs      # docker compose logs -f app
+```
 
 ## Architecture
 
@@ -201,6 +227,12 @@ app/
 tests/
   helpers.py         auth_headers(), create_approval_request() — shared across test files
 migrations/          Alembic (async env.py), versions/1fe27f129dda_initial_schema.py
+Dockerfile           multi-stage (uv builder -> python:3.12-slim runtime), non-root user, HEALTHCHECK
+docker-entrypoint.sh alembic upgrade head, then exec uvicorn — migrate-then-serve
+docker-compose.yml   app + postgres:16-alpine (named volume, pg_isready healthcheck)
+.dockerignore        keeps tests/, dev tooling, and local state out of the image
+README.md            run/test commands, auth format, full API reference
+DESIGN.md            data model, service boundaries, retry/idempotency, events, known compromises
 ```
 
 Rationale: routes stay thin (parse → call service → map result to response); `domain/` has no FastAPI or
@@ -288,8 +320,22 @@ is the only place that knows about SQL.
 - **Enums stored by value, not by name**: SQLAlchemy's `Enum` type persists a Python enum member's
   `.name` by default (e.g. `"PENDING"`), not its `.value` (`"pending"`). All three enum columns pass
   `values_callable=lambda cls: [m.value for m in cls]` to store the lowercase value that matches the
-  wire format. Also `native_enum=False` everywhere (renders as `VARCHAR` + `CHECK`, not a Postgres native
-  `ENUM` type) so adding a new enum member later is a plain migration, not an `ALTER TYPE ... ADD VALUE`.
+  wire format. Also `native_enum=False` everywhere (renders as `VARCHAR`, not a Postgres native `ENUM`
+  type) so adding a new enum member later is a plain migration, not an `ALTER TYPE ... ADD VALUE`.
+- **Bug found by Phase 8's real-Postgres verification: `native_enum=False` does not imply a CHECK
+  constraint.** `create_constraint` is a *separate* `Enum(...)` parameter that defaults to `False`
+  independently of `native_enum` — so from Phase 1 through Phase 7, every enum column
+  (`source_type`/`status`/`action`) was a bare `VARCHAR(32)` with **zero** DB-level validation, and
+  nothing in the SQLite-only test suite could have revealed this (SQLite has no native `ENUM` either
+  way, so the two configurations look identical there). Confirmed via `CreateTable(...).compile(dialect=
+  postgresql.dialect())` before touching anything, then fixed by adding `create_constraint=True` to all
+  three columns in `app/db/models.py` *and* the not-yet-deployed migration (per the Conventions rule —
+  Alembic's autogenerate does not reliably detect `CHECK` constraint differences, so this had to be
+  edited by hand, not regenerated). Verified after the fix, against real Postgres: `\d` shows
+  `ck_approval_requests_source_type` etc., and a raw `INSERT ... VALUES ('not_a_real_type', ...)` via
+  `psql` is rejected with `violates check constraint`. This is exactly the kind of gap the "verify
+  empirically, don't trust memory" discipline from earlier phases exists to catch — it just took a real
+  Postgres instance, not SQLite, to surface it.
 - **JSON columns**: `sa.JSON().with_variant(postgresql.JSONB(), "postgresql")` — real `JSONB` (indexable,
   containment queries) on Postgres, portable plain `JSON` everywhere else including SQLite tests.
 - **`greenlet` is an explicit dependency**, not left implicit — SQLAlchemy's async engine raises at
@@ -384,6 +430,35 @@ is the only place that knows about SQL.
   (`"approval_request.created"`) since introducing an enum for one value would've been premature; Phase
   4 added three more (`.approved`/`.rejected`/`.cancelled`), at which point the duplication/typo risk
   became real, so all four now live in `app/domain/enums.py`.
+- **Multi-stage Dockerfile, uv builder + slim runtime**: dependency-install and project-install are two
+  separate `uv sync` calls in their own `COPY`+`RUN` layers, specifically so editing application code
+  doesn't invalidate the (much slower) dependency-resolution layer on rebuild. The runtime stage starts
+  fresh from `python:3.12-slim-bookworm` (no `uv`, no build tooling, no apt cache) and just copies the
+  already-built `.venv` + app code — smaller image, smaller attack surface. Runs as a non-root `appuser`
+  (uid 1000); `--chown` on the `COPY` avoids a separate `chown -R` layer over the whole tree.
+- **Migrate-then-serve entrypoint, not a startup event**: `docker-entrypoint.sh` runs
+  `alembic upgrade head` before `exec uvicorn`, rather than running migrations from inside the app's own
+  FastAPI startup handler. This keeps "apply schema changes" a distinct, visible step in container logs
+  (and a distinct failure mode — `set -e` means a bad migration stops the container before it ever binds
+  a port) separate from "serve requests," and matches how migrations are already run for local/manual use
+  (`uv run alembic upgrade head`) — one mechanism, two invocation paths.
+- **`HEALTHCHECK` hits `/health` (liveness), not `/ready` (readiness)**: Docker's `HEALTHCHECK` and
+  compose's `depends_on: condition: service_healthy` model "is the container up," not "is every
+  downstream dependency reachable right now" — that distinction already exists at the `/health` vs
+  `/ready` layer (Phase 1). Nothing in this compose file needs to wait on the *app* being ready (only the
+  app needs to wait on *Postgres*), so liveness is the right check here. Uses `python -c
+  "urllib.request..."` rather than installing `curl` into the slim image — stdlib is already there.
+- **Tests stay out of the image** (`.dockerignore` excludes `tests/`): the image is a lean runtime
+  artifact; `uv run pytest` locally (or in CI) is the test-running path, matching how the assignment's
+  README run/test commands are already split (`make run` vs `make test`). Running tests *inside* the
+  built container was considered and rejected — it would mean shipping dev dependencies (pytest, ruff)
+  into the runtime image, which is exactly the attack-surface/image-bloat tradeoff multi-stage builds
+  exist to avoid.
+- **Postgres data in a named volume, port 5432 published to the host**: the volume means
+  `docker compose down` (without `-v`) preserves data across restarts, matching real deployment behavior
+  more closely than an ephemeral container filesystem; publishing 5432 is a deliberate local-dev
+  convenience (connect with `psql`/a GUI client directly) accepted as a minor, documented tradeoff against
+  the small risk of colliding with a host Postgres already using that port.
 
 ## Conventions
 

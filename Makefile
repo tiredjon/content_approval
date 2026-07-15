@@ -1,4 +1,4 @@
-.PHONY: install run test lint format
+.PHONY: install run test lint format docker-up docker-down docker-logs docker-build
 
 install:
 	uv sync
@@ -14,3 +14,15 @@ lint:
 
 format:
 	uv run ruff format .
+
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up --build
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f app

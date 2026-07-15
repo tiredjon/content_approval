@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: approval
+      POSTGRES_PASSWORD: approval
+      POSTGRES_DB: approval_service
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U approval -d approval_service"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APPROVAL_DATABASE_URL: postgresql+asyncpg://approval:approval@db:5432/approval_service
+      APPROVAL_ENV: docker
+      APPROVAL_LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:

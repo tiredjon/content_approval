@@ -1,0 +1,39 @@
+# Version control / editor / OS
+.git/
+.github/
+.vscode/
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environment (rebuilt inside the image by uv)
+.venv/
+
+# Test / lint artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+tests/
+
+# Local env / db files — never bake secrets or local state into the image
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite3
+
+# Docs not needed at runtime
+CLAUDE.md
+DESIGN.md
+README.md
+Тестовое задание В.md
